@@ -1,17 +1,16 @@
-import type { PublicKeyCredentialWithAssertionJSON, PublicKeyCredentialWithAttestationJSON } from "@github/webauthn-json";
-
+import type { AuthenticationResponseJSON, RegistrationResponseJSON } from "@simplewebauthn/server";
 
 
 export type RegisterUserParams = {
   email: string;
   username: string;
-  credential: PublicKeyCredentialWithAttestationJSON;
+  credential: RegistrationResponseJSON;
   challenge: string;
 };
 
 export type LoginUserParams = {
   email: string;
-  credential: PublicKeyCredentialWithAssertionJSON;
+  credential: AuthenticationResponseJSON;
   challenge: string;
 };
 

@@ -1,13 +1,12 @@
-// app/dashboard/page.tsx
+// app/profile/page.tsx
 
 import LogoutButton from "@/components/LogoutButton";
-import { getSession } from "@/lib/session";  // Adjust based on your actual session management function
+import { getSession } from "@/lib/session";
 
 
 export default async function ProfilePage() {
-    // Get session on the server side
-    const session = await getSession();
-
+    // Ensure the user has a valid session (middleware enforces auth)
+    await getSession();
 
     return (
         <div className="p-4">

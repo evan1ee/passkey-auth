@@ -51,7 +51,7 @@ components/
 └── ui/button.tsx          # Reusable button (Radix UI + CVA)
 
 lib/
-├── auth.ts                # Server-side WebAuthn + in-memory challenge store
+├── auth.ts                # Server-side WebAuthn verification + challenge generation
 ├── webauth.ts             # Client-side WebAuthn operations (SimpleWebAuthn browser)
 ├── credential-store.ts    # localStorage CRUD for passkey credentials
 ├── session.ts             # iron-session management
@@ -69,10 +69,10 @@ middleware.ts              # Route protection (/dashboard, /profile, /logout)
 ## Key Architecture Decisions
 
 - **Session-based auth:** Uses `iron-session` encrypted cookies (SESSION_SECRET from env), not JWT
-- **Challenge replay protection:** In-memory `Map<string, { expiresAt }>` stores server-issued challenges with 5-minute TTL. Each challenge is consumed (deleted) after single use.
+- **Challenge replay protection:** Challenges are stored in the encrypted session cookie (not in-memory). Each challenge is consumed (cleared) after single use. This works in serverless environments (Vercel) where in-memory state is not shared between function invocations.
 - **WebAuthn flow is in the dashboard:** The `/dashboard` page is an interactive step-by-step demo of all 6 passkey lifecycle steps
 - **Challenges are server-generated:** `crypto.randomBytes(32).toString("base64url")`
-- **Server extracts challenges from clientDataJSON:** API routes don't receive challenges from the client body — they parse `clientDataJSON` and validate against the server-side store
+- **Challenge flow:** `getChallenge()` server action generates challenge → saves to session cookie → returns to client. API routes read the challenge from the session cookie and pass it to SimpleWebAuthn's `expectedChallenge` parameter for validation.
 - **Credential storage (demo):** `localStorage` via `lib/credential-store.ts`. In production, use the Prisma `Credential` model
 - **Two auth paths:** Traditional email/password (session-based demo) and passkey (dashboard demo)
 - **No password in session:** The `SessionData` type has no `password` field. Passwords are never stored in cookies or returned in API responses.
@@ -110,7 +110,7 @@ openssl rand -base64 32
 ## Security Notes
 
 - **No hardcoded secrets** — session password comes from `SESSION_SECRET` env var
-- **Challenge replay protection** — each challenge is stored server-side, validated on use, then deleted
+- **Challenge replay protection** — each challenge is stored in the session cookie, validated on use, then cleared (single-use). Works in serverless (Vercel) environments.
 - **No password leakage** — passwords never appear in session cookies, error responses, or API outputs
 - **Cookie hardening** — httpOnly (XSS), sameSite: lax (CSRF), maxAge (expiry)
 - **Middleware checks both auth methods** — `isLoggedIn` OR `isPasskeyLoggedIn`

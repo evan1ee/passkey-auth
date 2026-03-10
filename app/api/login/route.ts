@@ -9,11 +9,11 @@ import { getSession } from "@/lib/session";
 //   - credential: { id, publicKey, counter } from localStorage
 //
 // The server:
-//   1. Verifies the assertion signature, origin, RP ID, and challenge
-//      (challenge is validated internally via the server-side store)
-//   2. Creates an authenticated session
+//   1. Reads the expected challenge from the session cookie
+//   2. Verifies the assertion signature, origin, RP ID, and challenge
+//   3. Creates an authenticated session
 //
-// In production, step 1 would look up the credential from a database
+// In production, step 2 would look up the credential from a database
 // by its ID, instead of trusting client-provided public key data.
 
 export async function POST(request: Request) {
@@ -57,11 +57,24 @@ export async function POST(request: Request) {
       );
     }
 
+    // ── Read and consume the challenge from the session cookie ─────────
+    // The challenge was stored when the client called getChallenge().
+    // We read it here and immediately clear it (single-use).
+    const session = await getSession();
+    const expectedChallenge = session.challenge;
+
+    if (!expectedChallenge) {
+      return NextResponse.json(
+        { success: false, error: "No challenge found in session — generate a challenge first" },
+        { status: 400 }
+      );
+    }
+
+    // Clear the challenge (single-use: prevents replay attacks)
+    session.challenge = undefined;
+    await session.save();
+
     // ── Verify the authentication assertion ───────────────────────────
-    // verifyAuthentication() handles challenge validation internally:
-    // it extracts the challenge from clientDataJSON and validates it
-    // against the server-side store (single-use, 5-minute TTL).
-    //
     // Reconstruct the public key as Uint8Array from the client-provided array.
     // In production, look up the credential from the database instead:
     //   const storedCredential = await prisma.credential.findUnique({
@@ -75,7 +88,8 @@ export async function POST(request: Request) {
         id: credential.id,
         publicKey: publicKeyArray,
         counter: credential.counter,
-      }
+      },
+      expectedChallenge
     );
 
     if (!verificationResponse.verified) {
@@ -86,10 +100,11 @@ export async function POST(request: Request) {
     }
 
     // ── Create authenticated session ──────────────────────────────────
-    const session = await getSession();
-    session.isLoggedIn = true;
-    session.isPasskeyLoggedIn = true;
-    await session.save();
+    // Re-read session (challenge was already cleared above)
+    const authSession = await getSession();
+    authSession.isLoggedIn = true;
+    authSession.isPasskeyLoggedIn = true;
+    await authSession.save();
 
     return NextResponse.json(
       {

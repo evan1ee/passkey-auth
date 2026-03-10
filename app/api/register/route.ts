@@ -1,15 +1,16 @@
 import { NextResponse } from "next/server";
 import { verifyRegistration } from "@/lib/auth";
+import { getSession } from "@/lib/session";
 
 // POST /api/register — Verify a WebAuthn registration (attestation) response.
 //
 // The client sends the attestation credential from the browser's
 // navigator.credentials.create() call. The server:
-//   1. Verifies the attestation signature, origin, RP ID, and challenge
-//      (challenge is validated internally via the server-side store)
-//   2. Returns the credential ID, public key, and counter for client-side storage
+//   1. Reads the expected challenge from the session cookie
+//   2. Verifies the attestation signature, origin, RP ID, and challenge
+//   3. Returns the credential ID, public key, and counter for client-side storage
 //
-// In production, step 2 would save the credential to a database instead.
+// In production, step 3 would save the credential to a database instead.
 
 export async function POST(request: Request) {
   try {
@@ -25,11 +26,25 @@ export async function POST(request: Request) {
 
     const { credential } = body;
 
+    // ── Read and consume the challenge from the session cookie ─────────
+    // The challenge was stored when the client called getChallenge().
+    // We read it here and immediately clear it (single-use).
+    const session = await getSession();
+    const expectedChallenge = session.challenge;
+
+    if (!expectedChallenge) {
+      return NextResponse.json(
+        { success: false, error: "No challenge found in session — generate a challenge first" },
+        { status: 400 }
+      );
+    }
+
+    // Clear the challenge (single-use: prevents replay attacks)
+    session.challenge = undefined;
+    await session.save();
+
     // ── Verify the registration attestation ───────────────────────────
-    // verifyRegistration() handles challenge validation internally:
-    // it extracts the challenge from clientDataJSON and validates it
-    // against the server-side store (single-use, 5-minute TTL).
-    const verification = await verifyRegistration(credential);
+    const verification = await verifyRegistration(credential, expectedChallenge);
 
     if (!verification.verified || !verification.registrationInfo) {
       return NextResponse.json(

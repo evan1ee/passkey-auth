@@ -11,6 +11,7 @@ export interface SessionData {
   email: string;
   isLoggedIn: boolean;
   isPasskeyLoggedIn?: boolean;
+  challenge?: string; // Current WebAuthn challenge (single-use, cleared after verification)
 }
 
 // ─── Server Action Form State ────────────────────────────────────────

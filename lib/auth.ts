@@ -12,80 +12,19 @@ import type {
 import crypto from "crypto";
 import { rpConfig } from "./config";
 
-// ─── In-Memory Challenge Store ───────────────────────────────────────
-// Stores server-issued challenges with TTL to prevent replay attacks.
-// In production, replace this with a database-backed store (e.g. Prisma).
+// ─── Challenge Generation ─────────────────────────────────────────────
+// Generates a cryptographic challenge for WebAuthn ceremonies.
 //
-// IMPORTANT: We attach the Map to `globalThis` so it survives module
-// re-evaluations in Next.js dev mode. Without this, server actions and
-// API route handlers may get separate module instances (separate Maps),
-// causing consumeChallenge() to fail because the challenge was stored
-// in a different Map instance.
+// The challenge is a 32-byte random value encoded as base64url.
+// It must be stored in the session cookie by the caller (server action)
+// so it can be validated later by the API route that verifies the
+// WebAuthn response.
+//
+// This approach works in serverless environments (e.g., Vercel) where
+// in-memory state is not shared between function invocations.
 
-interface ChallengeEntry {
-  expiresAt: number; // Unix timestamp in ms
-}
-
-const globalForChallenge = globalThis as unknown as {
-  __challengeStore: Map<string, ChallengeEntry> | undefined;
-};
-
-const challengeStore =
-  globalForChallenge.__challengeStore ?? new Map<string, ChallengeEntry>();
-globalForChallenge.__challengeStore = challengeStore;
-
-const CHALLENGE_TTL_MS = 5 * 60 * 1000; // 5 minutes
-
-// Periodic cleanup of expired challenges (runs every 60 seconds)
-if (typeof setInterval !== "undefined") {
-  setInterval(() => {
-    const now = Date.now();
-    for (const [key, entry] of challengeStore) {
-      if (entry.expiresAt < now) {
-        challengeStore.delete(key);
-      }
-    }
-  }, 60_000);
-}
-
-/**
- * Generate a cryptographic challenge and store it server-side.
- *
- * The challenge is a 32-byte random value encoded as base64url.
- * It is stored in memory with a 5-minute TTL. The client must use it
- * within that window, and it can only be consumed once.
- */
 export function createChallenge(): string {
-  const challenge = crypto.randomBytes(32).toString("base64url");
-
-  challengeStore.set(challenge, {
-    expiresAt: Date.now() + CHALLENGE_TTL_MS,
-  });
-
-  return challenge;
-}
-
-/**
- * Validate and consume a challenge (single-use).
- *
- * Returns true if the challenge was issued by this server and hasn't expired.
- * The challenge is deleted after consumption to prevent replay attacks.
- */
-export function consumeChallenge(value: string): boolean {
-  const entry = challengeStore.get(value);
-
-  if (!entry) {
-    return false; // Challenge was never issued or already consumed
-  }
-
-  // Always delete — whether valid or expired
-  challengeStore.delete(value);
-
-  if (entry.expiresAt < Date.now()) {
-    return false; // Challenge has expired
-  }
-
-  return true;
+  return crypto.randomBytes(32).toString("base64url");
 }
 
 // ─── WebAuthn Host Settings ──────────────────────────────────────────
@@ -101,16 +40,18 @@ const HOST_SETTINGS = {
 /**
  * Verify a WebAuthn registration (attestation) response.
  *
- * Uses `expectedChallenge` as a validator function — SimpleWebAuthn extracts
- * the challenge from clientDataJSON internally and passes it to our function,
- * which validates it against the server-side challenge store (single-use).
+ * The expectedChallenge is the challenge string previously stored in
+ * the session cookie when `getChallenge()` was called. SimpleWebAuthn
+ * extracts the challenge from clientDataJSON and compares it against
+ * this value.
  */
 export async function verifyRegistration(
-  credential: RegistrationResponseJSON
+  credential: RegistrationResponseJSON,
+  expectedChallenge: string
 ): Promise<VerifiedRegistrationResponse> {
   const verification = await verifyRegistrationResponse({
     response: credential,
-    expectedChallenge: (challenge: string) => consumeChallenge(challenge),
+    expectedChallenge,
     requireUserVerification: true,
     ...HOST_SETTINGS,
   });
@@ -127,17 +68,19 @@ export async function verifyRegistration(
 /**
  * Verify a WebAuthn authentication (assertion) response.
  *
- * Uses `expectedChallenge` as a validator function — SimpleWebAuthn extracts
- * the challenge from clientDataJSON internally and passes it to our function,
- * which validates it against the server-side challenge store (single-use).
+ * The expectedChallenge is the challenge string previously stored in
+ * the session cookie when `getChallenge()` was called. SimpleWebAuthn
+ * extracts the challenge from clientDataJSON and compares it against
+ * this value.
  */
 export async function verifyAuthentication(
   assertionCredential: AuthenticationResponseJSON,
-  credential: WebAuthnCredential
+  credential: WebAuthnCredential,
+  expectedChallenge: string
 ): Promise<VerifiedAuthenticationResponse> {
   const verification = await verifyAuthenticationResponse({
     response: assertionCredential,
-    expectedChallenge: (challenge: string) => consumeChallenge(challenge),
+    expectedChallenge,
     credential,
     ...HOST_SETTINGS,
   });

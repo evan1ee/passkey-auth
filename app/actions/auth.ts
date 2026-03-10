@@ -84,10 +84,18 @@ export async function logout() {
 
 // ─── Challenge Generation ────────────────────────────────────────────
 // Creates a server-side challenge for WebAuthn ceremonies.
-// The challenge is stored in memory with a 5-minute TTL.
+// The challenge is saved in the encrypted session cookie so it can be
+// validated later by the API route (works in serverless environments).
 
 export async function getChallenge(): Promise<string> {
-  return createChallenge();
+  const challenge = createChallenge();
+
+  // Persist challenge in the session cookie (single-use)
+  const session = await getSession();
+  session.challenge = challenge;
+  await session.save();
+
+  return challenge;
 }
 
 // ─── Session Data ────────────────────────────────────────────────────

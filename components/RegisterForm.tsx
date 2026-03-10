@@ -1,4 +1,4 @@
-// app/components/LoginForm.tsx
+// components/RegisterForm.tsx
 "use client"
 
 import { register } from "@/app/actions/auth";

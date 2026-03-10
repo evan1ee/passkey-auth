@@ -1,73 +1,146 @@
-import {verifyAuthenticationResponse, verifyRegistrationResponse } from "@simplewebauthn/server";
+import {
+  verifyAuthenticationResponse,
+  verifyRegistrationResponse,
+} from "@simplewebauthn/server";
 import type {
   AuthenticationResponseJSON,
+  RegistrationResponseJSON,
   VerifiedAuthenticationResponse,
   VerifiedRegistrationResponse,
+  WebAuthnCredential,
 } from "@simplewebauthn/server";
-
-
-import type {WebAuthnCredential} from "@simplewebauthn/server"
-
-
 import crypto from "crypto";
+import { rpConfig } from "./config";
 
-const HOST_SETTINGS = {
-  expectedOrigin: process.env.NEXT_PUBLIC_URL || "http://localhost:3000",
-  expectedRPID: process.env.NEXT_PUBLIC_SITE_ID  || "localhost",
+// ─── In-Memory Challenge Store ───────────────────────────────────────
+// Stores server-issued challenges with TTL to prevent replay attacks.
+// In production, replace this with a database-backed store (e.g. Prisma).
+//
+// IMPORTANT: We attach the Map to `globalThis` so it survives module
+// re-evaluations in Next.js dev mode. Without this, server actions and
+// API route handlers may get separate module instances (separate Maps),
+// causing consumeChallenge() to fail because the challenge was stored
+// in a different Map instance.
+
+interface ChallengeEntry {
+  expiresAt: number; // Unix timestamp in ms
+}
+
+const globalForChallenge = globalThis as unknown as {
+  __challengeStore: Map<string, ChallengeEntry> | undefined;
 };
 
-// Helper to clean strings (Base64url encoding)
-function clean(str: string) {
-  return str.replace(/\+/g, "-").replace(/\//g, "_").replace(/=/g, "");
+const challengeStore =
+  globalForChallenge.__challengeStore ?? new Map<string, ChallengeEntry>();
+globalForChallenge.__challengeStore = challengeStore;
+
+const CHALLENGE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+
+// Periodic cleanup of expired challenges (runs every 60 seconds)
+if (typeof setInterval !== "undefined") {
+  setInterval(() => {
+    const now = Date.now();
+    for (const [key, entry] of challengeStore) {
+      if (entry.expiresAt < now) {
+        challengeStore.delete(key);
+      }
+    }
+  }, 60_000);
 }
 
-// Convert binary to base64url
-function binaryToBase64url(bytes: Uint8Array) {
-  let str = "";
+/**
+ * Generate a cryptographic challenge and store it server-side.
+ *
+ * The challenge is a 32-byte random value encoded as base64url.
+ * It is stored in memory with a 5-minute TTL. The client must use it
+ * within that window, and it can only be consumed once.
+ */
+export function createChallenge(): string {
+  const challenge = crypto.randomBytes(32).toString("base64url");
 
-  bytes.forEach((charCode) => {
-    str += String.fromCharCode(charCode);
+  challengeStore.set(challenge, {
+    expiresAt: Date.now() + CHALLENGE_TTL_MS,
   });
 
-  return btoa(str);
+  return challenge;
 }
 
-// Generate a challenge for registration or login
-export function generateChallenge() {
-  return clean(crypto.randomBytes(32).toString("base64"));
-}
+/**
+ * Validate and consume a challenge (single-use).
+ *
+ * Returns true if the challenge was issued by this server and hasn't expired.
+ * The challenge is deleted after consumption to prevent replay attacks.
+ */
+export function consumeChallenge(value: string): boolean {
+  const entry = challengeStore.get(value);
 
-// Verify Registration 
-export async function verifyRegistration(credential: any, challenge: string) {
-  let verification: VerifiedRegistrationResponse;
-  try {
-    verification = await verifyRegistrationResponse({
-      response: credential,
-      expectedChallenge: challenge,
-      requireUserVerification: true,
-      ...HOST_SETTINGS,
-    });
-  } catch (error) {
-    console.error(error);
-    throw error;
+  if (!entry) {
+    return false; // Challenge was never issued or already consumed
   }
+
+  // Always delete — whether valid or expired
+  challengeStore.delete(value);
+
+  if (entry.expiresAt < Date.now()) {
+    return false; // Challenge has expired
+  }
+
+  return true;
+}
+
+// ─── WebAuthn Host Settings ──────────────────────────────────────────
+// Derived from centralized rpConfig. Used by both verification functions.
+
+const HOST_SETTINGS = {
+  expectedOrigin: rpConfig.expectedOrigin,
+  expectedRPID: rpConfig.rpId,
+};
+
+// ─── Registration Verification ───────────────────────────────────────
+
+/**
+ * Verify a WebAuthn registration (attestation) response.
+ *
+ * Uses `expectedChallenge` as a validator function — SimpleWebAuthn extracts
+ * the challenge from clientDataJSON internally and passes it to our function,
+ * which validates it against the server-side challenge store (single-use).
+ */
+export async function verifyRegistration(
+  credential: RegistrationResponseJSON
+): Promise<VerifiedRegistrationResponse> {
+  const verification = await verifyRegistrationResponse({
+    response: credential,
+    expectedChallenge: (challenge: string) => consumeChallenge(challenge),
+    requireUserVerification: true,
+    ...HOST_SETTINGS,
+  });
+
   if (!verification.verified) {
     throw new Error("Registration verification failed");
   }
-  return  verification;
+
+  return verification;
 }
 
+// ─── Authentication Verification ─────────────────────────────────────
 
-// Verify Registration 
-export async function verifyAuthentication(assertionCredential: any, challenge: string, credential: WebAuthnCredential ) {
-  let verification: VerifiedAuthenticationResponse;
-    verification = await verifyAuthenticationResponse({
-      response: assertionCredential,
-      expectedChallenge: challenge,
-      credential:credential,
-      ...HOST_SETTINGS,
-    });
-  return  verification;
+/**
+ * Verify a WebAuthn authentication (assertion) response.
+ *
+ * Uses `expectedChallenge` as a validator function — SimpleWebAuthn extracts
+ * the challenge from clientDataJSON internally and passes it to our function,
+ * which validates it against the server-side challenge store (single-use).
+ */
+export async function verifyAuthentication(
+  assertionCredential: AuthenticationResponseJSON,
+  credential: WebAuthnCredential
+): Promise<VerifiedAuthenticationResponse> {
+  const verification = await verifyAuthenticationResponse({
+    response: assertionCredential,
+    expectedChallenge: (challenge: string) => consumeChallenge(challenge),
+    credential,
+    ...HOST_SETTINGS,
+  });
+
+  return verification;
 }
-
-

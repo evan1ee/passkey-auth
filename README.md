@@ -1,14 +1,15 @@
 # Passkey Auth
 
-A full-stack WebAuthn/Passkey authentication demo built with **Next.js 15**, **SimpleWebAuthn**, **Prisma**, and **PostgreSQL**. This project demonstrates the complete passkey registration and login lifecycle with an interactive step-by-step dashboard.
+A full-stack WebAuthn/Passkey authentication demo built with **Next.js 15**, **SimpleWebAuthn**, **Prisma**, and **iron-session**. This project demonstrates the complete passkey registration and login lifecycle with an interactive step-by-step dashboard.
 
 ## Features
 
 - Passwordless authentication using WebAuthn/FIDO2 passkeys
 - Interactive 6-step dashboard demonstrating the full passkey lifecycle
 - Server-side credential verification with SimpleWebAuthn
-- PostgreSQL credential storage via Prisma ORM
-- Encrypted cookie sessions with iron-session
+- Server-side challenge store with replay protection (in-memory with TTL)
+- Credential persistence via browser localStorage (database-ready Prisma schema included)
+- Encrypted cookie sessions with iron-session (httpOnly, sameSite, maxAge)
 - Route protection via Next.js middleware
 
 ## Tech Stack
@@ -16,11 +17,12 @@ A full-stack WebAuthn/Passkey authentication demo built with **Next.js 15**, **S
 | Layer | Technology |
 |-------|-----------|
 | Framework | Next.js 15 (App Router, Turbopack) |
-| Language | TypeScript 5 |
+| Language | TypeScript 5 (strict mode) |
 | UI | React 19, Tailwind CSS 3.4 |
 | WebAuthn | @simplewebauthn/browser + @simplewebauthn/server |
-| Database | PostgreSQL (Supabase) via Prisma 6.3 |
-| Sessions | iron-session |
+| Database | PostgreSQL (Supabase) via Prisma 6.3 (schema defined) |
+| Sessions | iron-session (encrypted cookies) |
+| Persistence | localStorage (demo) / Prisma (production-ready schema) |
 | Package Manager | pnpm |
 
 ## Getting Started
@@ -29,7 +31,7 @@ A full-stack WebAuthn/Passkey authentication demo built with **Next.js 15**, **S
 
 - Node.js 18+
 - pnpm
-- PostgreSQL database (or Supabase account)
+- PostgreSQL database (optional — demo works without it using localStorage)
 
 ### Installation
 
@@ -48,6 +50,12 @@ DATABASE_URL="postgresql://user:password@host:6543/postgres?pgbouncer=true"
 DIRECT_URL="postgresql://user:password@host:5432/postgres"
 NEXT_PUBLIC_SITE_ID=localhost
 NEXT_PUBLIC_URL=http://localhost:3000
+SESSION_SECRET=replace-me-with-a-random-string-at-least-32-chars
+```
+
+Generate a secure `SESSION_SECRET`:
+```bash
+openssl rand -base64 32
 ```
 
 | Variable | Description |
@@ -56,8 +64,9 @@ NEXT_PUBLIC_URL=http://localhost:3000
 | `DIRECT_URL` | Direct database connection (used for migrations) |
 | `NEXT_PUBLIC_SITE_ID` | WebAuthn Relying Party ID — your domain (e.g., `localhost` for dev) |
 | `NEXT_PUBLIC_URL` | WebAuthn expected origin — full URL including protocol |
+| `SESSION_SECRET` | **Required.** iron-session encryption key (min 32 characters) |
 
-### Database Setup
+### Database Setup (Optional)
 
 ```bash
 npx prisma generate
@@ -76,13 +85,13 @@ Open [http://localhost:3000](http://localhost:3000).
 
 ## How Passkey Authentication Works
 
-Passkeys use the **WebAuthn** (Web Authentication) standard to replace passwords with public-key cryptography. Instead of sending a shared secret (password) to the server, the user's device creates a **key pair** — the private key never leaves the device, and only the public key is stored on the server.
+Passkeys use the **WebAuthn** (Web Authentication) standard to replace passwords with public-key cryptography. Instead of sending a shared secret (password) to the server, the user's device creates a **key pair** — the private key never leaves the device, and only the public key is stored server-side.
 
 ### Core Concepts
 
 - **Relying Party (RP):** Your website/application that requests authentication
 - **Authenticator:** The user's device (phone, laptop, security key) that creates and stores credentials
-- **Challenge:** A random server-generated value used to prevent replay attacks
+- **Challenge:** A random server-generated value stored server-side and consumed on use — prevents replay attacks
 - **Attestation:** The authenticator's response during registration, containing the new public key
 - **Assertion:** The authenticator's response during login, containing a signature proving possession of the private key
 
@@ -114,40 +123,47 @@ REGISTRATION                          AUTHENTICATION
 
 ### Step 1 & 4: Generate Challenge (Server)
 
-The server generates a cryptographically random challenge to prevent replay attacks. The same function is used for both registration and authentication.
+The server generates a cryptographically random challenge, stores it in an in-memory store with a 5-minute TTL, and returns it to the client. Each challenge can only be used once.
 
-**`lib/auth.ts`** — Challenge generation:
+**`lib/auth.ts`** — Challenge generation and storage:
 
 ```typescript
 import crypto from "crypto";
 
-// Helper to clean strings (Base64url encoding)
-function clean(str: string) {
-  return str.replace(/\+/g, "-").replace(/\//g, "_").replace(/=/g, "");
+const challengeStore = new Map<string, { expiresAt: number }>();
+const CHALLENGE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+
+export function createChallenge(): string {
+  const challenge = crypto.randomBytes(32).toString("base64url");
+  challengeStore.set(challenge, {
+    expiresAt: Date.now() + CHALLENGE_TTL_MS,
+  });
+  return challenge;
 }
 
-// Generate a challenge for registration or login
-export function generateChallenge() {
-  return clean(crypto.randomBytes(32).toString("base64"));
+export function consumeChallenge(value: string): boolean {
+  const entry = challengeStore.get(value);
+  if (!entry) return false;
+  challengeStore.delete(value); // Single-use: delete after consumption
+  return entry.expiresAt >= Date.now();
 }
 ```
 
 **How it works:**
 1. `crypto.randomBytes(32)` generates 32 random bytes (256 bits of entropy)
-2. Converts to Base64 string
-3. `clean()` converts standard Base64 to **Base64url** format (replacing `+` with `-`, `/` with `_`, and stripping `=` padding) — required by the WebAuthn spec
+2. `.toString("base64url")` encodes directly as Base64url (WebAuthn-compatible)
+3. The challenge is stored server-side in a `Map` with a 5-minute expiry
+4. On verification, `consumeChallenge()` checks validity and deletes it — preventing replay attacks
 
 The challenge is exposed to the client via a server action:
 
-**`app/actions/auth.ts`**:
-
 ```typescript
-"use server"
-import { generateChallenge } from "@/lib/auth";
+// app/actions/auth.ts
+"use server";
+import { createChallenge } from "@/lib/auth";
 
-export async function getChallenge() {
-  const challenge = generateChallenge();
-  return challenge;
+export async function getChallenge(): Promise<string> {
+  return createChallenge();
 }
 ```
 
@@ -155,7 +171,7 @@ export async function getChallenge() {
 
 ### Step 2: Create Credential — Registration (Browser)
 
-When the user clicks "Register Passkey", the browser prompts the authenticator (device biometric, security key, etc.) to create a new key pair.
+When the user clicks "Register Passkey", the browser prompts the authenticator (Touch ID, Face ID, Windows Hello, security key, etc.) to create a new key pair.
 
 **`lib/webauth.ts`** — Client-side registration:
 
@@ -170,19 +186,19 @@ export const registerWebAuthnCredential = async (
 ) => {
   return await startRegistration({
     optionsJSON: {
-      challenge: challenge,
+      challenge,
       rp: {
-        name: "Passkey-authn",
-        id: process.env.NEXT_PUBLIC_SITE_ID || "localhost",
+        name: "Passkey Auth Demo",
+        id: getRpId(), // From NEXT_PUBLIC_SITE_ID env var
       },
       user: {
-        id: window.crypto.randomUUID(),
+        id: crypto.randomUUID(),
         name: email,
         displayName: username,
       },
       pubKeyCredParams: [
         { alg: -7, type: "public-key" },   // ES256 (ECDSA w/ SHA-256)
-        { alg: -257, type: "public-key" },  // RS256 (RSASSA-PKCS1-v1_5 w/ SHA-256)
+        { alg: -257, type: "public-key" },  // RS256 (RSASSA-PKCS1-v1_5)
       ],
       timeout: 60000,
       attestation: "direct",
@@ -201,7 +217,7 @@ export const registerWebAuthnCredential = async (
 |-----------|-------|---------|
 | `challenge` | Server-generated random string | Prevents replay attacks |
 | `rp.id` | Your domain (e.g., `localhost`) | Binds the credential to your site |
-| `rp.name` | `"Passkey-authn"` | Display name shown to user |
+| `rp.name` | Display name | Shown to user during prompt |
 | `user.id` | Random UUID | Unique user handle (not the username) |
 | `pubKeyCredParams` | ES256, RS256 | Supported signing algorithms |
 | `attestation` | `"direct"` | Request attestation statement from authenticator |
@@ -219,23 +235,41 @@ export const registerWebAuthnCredential = async (
 
 ### Step 3: Verify Registration & Store Credential (Server)
 
-The attestation response is sent to the server for verification, then the credential is stored in the database.
+The attestation response is sent to the server. The server extracts the challenge from `clientDataJSON`, validates it against the server-side store, and verifies the attestation.
 
 **`app/api/register/route.ts`** — Registration API endpoint:
 
 ```typescript
-import { verifyRegistration } from "@/lib/auth";
+import { verifyRegistration, consumeChallenge } from "@/lib/auth";
 
 export async function POST(request: Request) {
-  const body = await request.json();
-  const { credential, challenge } = body;
+  const { credential } = await request.json();
 
-  // Verify the registration with SimpleWebAuthn
-  const verificationResponse = await verifyRegistration(credential, challenge);
+  // 1. Extract challenge from the browser's clientDataJSON
+  const clientDataJSON = JSON.parse(
+    Buffer.from(credential.response.clientDataJSON, "base64url").toString()
+  );
 
+  // 2. Validate challenge was server-issued and unexpired
+  if (!consumeChallenge(clientDataJSON.challenge)) {
+    return NextResponse.json(
+      { success: false, error: "Invalid or expired challenge" },
+      { status: 400 }
+    );
+  }
+
+  // 3. Verify the attestation with SimpleWebAuthn
+  const verification = await verifyRegistration(credential, clientDataJSON.challenge);
+
+  // 4. Return credential data for client-side storage
+  const { credential: regCredential } = verification.registrationInfo;
   return NextResponse.json({
     success: true,
-    data: { verificationResponse },
+    data: {
+      credentialId: regCredential.id,
+      publicKey: Array.from(regCredential.publicKey),
+      counter: regCredential.counter,
+    },
   });
 }
 ```
@@ -244,18 +278,18 @@ export async function POST(request: Request) {
 
 ```typescript
 import { verifyRegistrationResponse } from "@simplewebauthn/server";
+import { rpConfig } from "./config";
 
-const HOST_SETTINGS = {
-  expectedOrigin: process.env.NEXT_PUBLIC_URL || "http://localhost:3000",
-  expectedRPID: process.env.NEXT_PUBLIC_SITE_ID || "localhost",
-};
-
-export async function verifyRegistration(credential: any, challenge: string) {
+export async function verifyRegistration(
+  credential: RegistrationResponseJSON,
+  expectedChallenge: string
+) {
   const verification = await verifyRegistrationResponse({
     response: credential,
-    expectedChallenge: challenge,
+    expectedChallenge,
     requireUserVerification: true,
-    ...HOST_SETTINGS,
+    expectedOrigin: rpConfig.expectedOrigin,
+    expectedRPID: rpConfig.rpId,
   });
 
   if (!verification.verified) {
@@ -266,48 +300,28 @@ export async function verifyRegistration(credential: any, challenge: string) {
 ```
 
 **What the server checks:**
-1. **Challenge matches** — the response contains the same challenge the server issued
+1. **Challenge valid** — extracted from clientDataJSON, validated against server-side store, consumed (single-use)
 2. **Origin matches** — the request came from the expected domain (`NEXT_PUBLIC_URL`)
-3. **RP ID matches** — the credential is bound to the correct relying party (`NEXT_PUBLIC_SITE_ID`)
+3. **RP ID matches** — the credential is bound to the correct relying party
 4. **User verification** — the user performed biometric/PIN verification
 5. **Attestation signature** — the attestation statement is cryptographically valid
 
-**After verification**, the credential data (ID, public key, counter) is extracted and stored:
-
-**`prisma/schema.prisma`** — Database schema:
+**After verification**, the credential (ID, public key, counter) is saved to `localStorage` for persistence across page reloads. In production, this would be saved to the database:
 
 ```prisma
-model User {
-  id          Int          @id @default(autoincrement())
-  email       String       @unique
-  username    String       @unique
-  credentials Credential[]
-  createdAt   DateTime     @default(now())
-  updatedAt   DateTime     @updatedAt
-}
-
 model Credential {
   id         Int      @id @default(autoincrement())
   user       User     @relation(fields: [userId], references: [id])
   userId     Int
-  name       String?
   externalId String   @unique    // credential ID from WebAuthn
   publicKey  Bytes    @unique    // public key stored as binary
   signCount  Int      @default(0) // counter for clone detection
-  createdAt  DateTime @default(now())
-  updatedAt  DateTime @updatedAt
 
   @@index([externalId])
 }
 ```
 
-**Why `signCount` matters:** Each time the authenticator signs an assertion, it increments its internal counter. The server stores this counter and checks that it always increases. If the counter ever goes backwards or doesn't increment, it could indicate the credential has been cloned — this is a security mechanism to detect credential duplication.
-
----
-
-### Step 4: Generate Challenge (Server)
-
-Same as Step 1 — a fresh random challenge is generated for the authentication ceremony. **A new challenge must be generated for every authentication attempt.**
+**Why `signCount` matters:** Each time the authenticator signs an assertion, it increments its internal counter. The server stores this counter and checks that it always increases. If the counter goes backwards, it indicates the credential may have been cloned.
 
 ---
 
@@ -323,10 +337,10 @@ import { startAuthentication } from "@simplewebauthn/browser";
 export const authenticateWithWebAuthn = async (challenge: string) => {
   return await startAuthentication({
     optionsJSON: {
-      challenge: challenge,
+      challenge,
       timeout: 60000,
       userVerification: "required",
-      rpId: process.env.NEXT_PUBLIC_SITE_ID || "localhost",
+      rpId: getRpId(),
     },
   });
 };
@@ -344,73 +358,58 @@ export const authenticateWithWebAuthn = async (challenge: string) => {
 
 ### Step 6: Verify Authentication (Server)
 
-The server verifies the assertion signature using the stored public key.
+The server extracts the challenge from the assertion's `clientDataJSON`, validates it, then verifies the signature using the stored public key.
 
 **`app/api/login/route.ts`** — Login API endpoint:
 
 ```typescript
-import { verifyAuthentication } from "@/lib/auth";
+import { verifyAuthentication, consumeChallenge } from "@/lib/auth";
 import { getSession } from "@/lib/session";
 
 export async function POST(request: Request) {
-  const body = await request.json();
-  const { assertionCredential, challenge, credential } = body;
+  const { assertionCredential, credential } = await request.json();
 
-  // Convert publicKey from JSON to Uint8Array
-  const publicKeyArray = new Uint8Array(Object.values(credential.publicKey));
+  // 1. Extract and validate challenge from clientDataJSON
+  const clientDataJSON = JSON.parse(
+    Buffer.from(assertionCredential.response.clientDataJSON, "base64url").toString()
+  );
+  if (!consumeChallenge(clientDataJSON.challenge)) {
+    return NextResponse.json(
+      { success: false, error: "Invalid or expired challenge" },
+      { status: 400 }
+    );
+  }
 
-  // Verify the authentication signature
-  const verificationResponse = await verifyAuthentication(
+  // 2. Verify signature using stored public key
+  const publicKeyArray = new Uint8Array(credential.publicKey);
+  const verification = await verifyAuthentication(
     assertionCredential,
-    challenge,
-    {
-      id: credential.id,
-      publicKey: publicKeyArray,
-      counter: credential.counter,
-    }
+    clientDataJSON.challenge,
+    { id: credential.id, publicKey: publicKeyArray, counter: credential.counter }
   );
 
-  // On success, create an authenticated session
-  if (verificationResponse.verified) {
+  // 3. Create authenticated session
+  if (verification.verified) {
     const session = await getSession();
+    session.isLoggedIn = true;
     session.isPasskeyLoggedIn = true;
     await session.save();
   }
 
   return NextResponse.json({
     success: true,
-    data: { verificationResponse },
+    data: { verified: true, newCounter: verification.authenticationInfo.newCounter },
   });
-}
-```
-
-**`lib/auth.ts`** — Server-side authentication verification:
-
-```typescript
-import { verifyAuthenticationResponse } from "@simplewebauthn/server";
-
-export async function verifyAuthentication(
-  assertionCredential: any,
-  challenge: string,
-  credential: WebAuthnCredential
-) {
-  const verification = await verifyAuthenticationResponse({
-    response: assertionCredential,
-    expectedChallenge: challenge,
-    credential: credential,
-    ...HOST_SETTINGS,
-  });
-  return verification;
 }
 ```
 
 **What the server checks:**
-1. **Signature is valid** — the assertion signature was produced by the private key matching the stored public key
-2. **Challenge matches** — prevents replay of old authentication responses
+1. **Challenge valid** — extracted from clientDataJSON, validated and consumed server-side
+2. **Signature is valid** — produced by the private key matching the stored public key
 3. **Origin and RP ID match** — credential was used on the correct domain
 4. **Sign count incremented** — counter is greater than previously stored value (clone detection)
 
-**On successful verification**, the session is updated with `isPasskeyLoggedIn = true`, and the user is authenticated.
+**On successful verification**, the session is updated with `isLoggedIn = true` and `isPasskeyLoggedIn = true`, and the counter is updated in localStorage.
 
 ---
 
@@ -425,7 +424,7 @@ export async function verifyAuthentication(
     │                             │                                │
     │  1. Request challenge       │                                │
     │  ────────────────────────►  │                                │
-    │                             │  Generate random bytes         │
+    │                             │  Generate + store challenge    │
     │  ◄────────────────────────  │                                │
     │       challenge             │                                │
     │                             │                                │
@@ -438,15 +437,19 @@ export async function verifyAuthentication(
     │                             │                                │
     │  3. POST /api/register      │                                │
     │  ────────────────────────►  │                                │
+    │                             │  Extract + consume challenge   │
     │                             │  Verify attestation            │
-    │                             │  Store public key + ID in DB   │
     │  ◄────────────────────────  │                                │
-    │       verified: true        │                                │
+    │       { credentialId,       │                                │
+    │         publicKey, counter }│                                │
+    │                             │                                │
+    │  Save to localStorage       │                                │
     │                             │                                │
     │  ══════ AUTHENTICATION ════ │                                │
     │                             │                                │
     │  4. Request challenge       │                                │
     │  ────────────────────────►  │                                │
+    │                             │  Generate + store challenge    │
     │  ◄────────────────────────  │                                │
     │       new challenge         │                                │
     │                             │                                │
@@ -458,14 +461,19 @@ export async function verifyAuthentication(
     │    assertion (signature, credential ID, authenticator data)  │
     │                             │                                │
     │  6. POST /api/login         │                                │
+    │  (assertion + credential    │                                │
+    │   from localStorage)        │                                │
     │  ────────────────────────►  │                                │
+    │                             │  Extract + consume challenge   │
     │                             │  Verify signature with         │
     │                             │  stored public key             │
-    │                             │  Check sign count              │
     │                             │  Create session                │
     │  ◄────────────────────────  │                                │
     │       verified: true        │                                │
     │       session created       │                                │
+    │                             │                                │
+    │  Update counter in          │                                │
+    │  localStorage               │                                │
 ```
 
 ---
@@ -476,10 +484,33 @@ export async function verifyAuthentication(
 |--------|-----------|----------|
 | **Phishing** | User can be tricked into entering password on fake site | Credential is bound to the RP ID (domain) — won't work on a different domain |
 | **Data breach** | Stolen password hashes can be cracked | Server only stores public key — useless without private key |
-| **Replay attack** | Intercepted password can be reused | Each authentication uses a unique challenge |
+| **Replay attack** | Intercepted password can be reused | Each authentication uses a unique server-stored challenge (consumed after use) |
 | **Credential stuffing** | Reused passwords across sites are exploited | Each credential is unique per site |
 | **Brute force** | Weak passwords can be guessed | Private keys are cryptographic (256-bit) |
 | **Man-in-the-middle** | Password can be intercepted in transit | Challenge-response with origin binding prevents MITM |
+
+---
+
+## Security Architecture
+
+### Session Security
+- **No hardcoded secrets:** Session encryption key from `SESSION_SECRET` env var
+- **Cookie hardening:** `httpOnly: true` (XSS), `sameSite: "lax"` (CSRF), `maxAge: 24h` (expiry)
+- **No password in session:** The `SessionData` type has no `password` field — passwords are never stored in cookies
+
+### Challenge Replay Protection
+- Challenges stored server-side in an in-memory `Map` with 5-minute TTL
+- Each challenge consumed (deleted) after single use
+- Server extracts challenges from `clientDataJSON` — never trusts client-supplied challenge values
+
+### API Safety
+- `/api/session` returns only explicitly selected safe fields — never the raw session object
+- `/api/register` returns only `credentialId`, `publicKey`, `counter` — never full verification internals
+- `/api/login` validates challenge before verification — rejects expired/reused challenges
+
+### Route Protection
+- Middleware checks **both** `isLoggedIn` and `isPasskeyLoggedIn` for protected routes
+- Protected routes: `/dashboard`, `/profile`, `/logout`
 
 ---
 
@@ -487,32 +518,18 @@ export async function verifyAuthentication(
 
 Sessions use `iron-session` for encrypted cookie-based storage:
 
-**`lib/session.ts`**:
-
 ```typescript
+// lib/types.ts
 export interface SessionData {
   userId: string;
   username?: string;
   email: string;
-  password?: string;
   isLoggedIn: boolean;
   isPasskeyLoggedIn?: boolean;
 }
 ```
 
-The session tracks both traditional login (`isLoggedIn`) and passkey login (`isPasskeyLoggedIn`) separately.
-
-## Route Protection
-
-**`middleware.ts`** protects routes by checking `session.isLoggedIn`:
-
-```typescript
-const protectedRoutes = ["/dashboard", "/profile", "/logout"];
-
-if (isProtectedRoute && !session.isLoggedIn) {
-  return NextResponse.redirect(new URL("/login", req.url));
-}
-```
+The session tracks both traditional login (`isLoggedIn`) and passkey login (`isPasskeyLoggedIn`).
 
 ---
 
@@ -522,14 +539,14 @@ if (isProtectedRoute && !session.isLoggedIn) {
 app/
 ├── actions/auth.ts        # Server actions (login, register, logout, getChallenge)
 ├── api/
-│   ├── register/route.ts  # POST — verify WebAuthn registration
-│   ├── login/route.ts     # POST — verify WebAuthn authentication
-│   └── session/route.ts   # GET — retrieve current session
+│   ├── register/route.ts  # POST — verify registration, return credential data
+│   ├── login/route.ts     # POST — verify authentication assertion
+│   └── session/route.ts   # GET — retrieve current session (safe fields)
 ├── dashboard/page.tsx     # Interactive passkey demo page
 ├── login/page.tsx
 ├── register/page.tsx
 ├── profile/page.tsx
-└── layout.tsx
+└── layout.tsx             # Root layout (includes Toaster)
 
 components/
 ├── RegisterForm.tsx       # Email/password registration form
@@ -538,16 +555,17 @@ components/
 └── ui/button.tsx          # Radix UI button component
 
 lib/
-├── auth.ts                # Server-side WebAuthn (SimpleWebAuthn server)
+├── auth.ts                # WebAuthn verification + in-memory challenge store
 ├── webauth.ts             # Client-side WebAuthn (SimpleWebAuthn browser)
+├── credential-store.ts    # localStorage CRUD for passkey credentials
 ├── session.ts             # iron-session management
-├── config.ts              # Session cookie configuration
-├── database.ts            # Prisma client singleton
-├── types.ts               # Shared TypeScript types
+├── config.ts              # Session + RP configuration (env-validated)
+├── database.ts            # Prisma client singleton (dev-safe)
+├── types.ts               # All shared TypeScript types
 └── utils.ts               # Utility functions
 
 prisma/
-└── schema.prisma          # User + Credential models
+└── schema.prisma          # User + Credential models (DB-ready)
 ```
 
 ## Learn More

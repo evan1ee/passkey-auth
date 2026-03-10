@@ -1,28 +1,28 @@
-// app/middleware.ts
-
 import { NextResponse } from "next/server";
-import { getSession } from "@/lib/session"; // Adjust based on your actual session management function
-import { NextRequest } from "next/server";
+import { getSession } from "@/lib/session";
+import type { NextRequest } from "next/server";
 
-// Middleware to check if the user is logged in
+// ─── Route Protection Middleware ─────────────────────────────────────
+// Redirects unauthenticated users to /login when accessing protected routes.
+// Checks both traditional login (isLoggedIn) and passkey login (isPasskeyLoggedIn).
+
+const protectedRoutes = ["/dashboard", "/profile", "/logout"];
+
 export async function middleware(req: NextRequest) {
-  const session = await getSession(); // Get session data
+  const session = await getSession();
 
-  // Check if the user is trying to access a protected route
-  const protectedRoutes = ["/dashboard", "/profile", "/logout"];  // Add more protected routes as needed
-  const isProtectedRoute = protectedRoutes.some(route => req.nextUrl.pathname.startsWith(route));
+  const isProtectedRoute = protectedRoutes.some((route) =>
+    req.nextUrl.pathname.startsWith(route)
+  );
 
-  // If the route is protected and the user is not logged in, redirect to login page
-  if (isProtectedRoute && !session.isLoggedIn) {
-    console.log("Redirecting to login...");
+  // Allow access if the user is authenticated via either method
+  if (isProtectedRoute && !session.isLoggedIn && !session.isPasskeyLoggedIn) {
     return NextResponse.redirect(new URL("/login", req.url));
   }
 
-  // Continue to the next middleware or page if not a protected route or user is logged in
   return NextResponse.next();
 }
 
-// Define the matcher to apply the middleware on specific routes
 export const config = {
-  matcher: ["/dashboard", "/profile","/logout"], // Add routes to be protected
+  matcher: ["/dashboard", "/profile", "/logout"],
 };

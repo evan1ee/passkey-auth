@@ -1,4 +1,4 @@
-// app/components/LoginForm.tsx
+// components/LoginForm.tsx
 "use client"
 
 import { login } from "@/app/actions/auth";

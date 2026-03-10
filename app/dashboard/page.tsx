@@ -275,6 +275,11 @@ export default function DashboardPage() {
 
       // Update the counter in localStorage
       if (result.data.newCounter != null) {
+        if (storedCredential.counter === result.data.newCounter && result.data.newCounter === 0) {
+          toast("Counter remained at 0 (typical for synced passkeys)", {
+            icon: "ℹ️",
+          });
+        }
         updateCredentialCounter(
           storedCredential.credentialId,
           result.data.newCounter
@@ -342,10 +347,16 @@ export default function DashboardPage() {
         <p className="text-sm font-medium text-gray-500">Counter</p>
         <p className="text-gray-800 break-all">
           {storedCredential?.counter ?? "—"}
-          <span className="text-[0.8rem] italic text-gray-500">
-            {" "}
-            (stored in localStorage)
-          </span>
+          {storedCredential?.counter === 0 && (
+            <span className="text-[0.7rem] block mt-1 text-gray-500 italic">
+              (Passkeys typically have a fixed counter of 0)
+            </span>
+          )}
+          {storedCredential?.counter !== 0 && (
+            <span className="text-[0.8rem] italic text-gray-500 block mt-1">
+              (stored in localStorage)
+            </span>
+          )}
         </p>
       </div>
     </div>
@@ -561,9 +572,8 @@ const WorkflowButton = ({
   <button
     onClick={onClick}
     disabled={disabled || isLoading}
-    className={`flex-1 py-3 px-6 bg-white border border-blue-500 rounded-xl text-blue-500 hover:bg-blue-50 transition-colors duration-200 relative ${
-      disabled ? "opacity-50 cursor-not-allowed" : ""
-    }`}
+    className={`flex-1 py-3 px-6 bg-white border border-blue-500 rounded-xl text-blue-500 hover:bg-blue-50 transition-colors duration-200 relative ${disabled ? "opacity-50 cursor-not-allowed" : ""
+      }`}
   >
     <span className="block text-sm font-semibold">
       {isLoading ? "Processing..." : label}
